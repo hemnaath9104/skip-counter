@@ -10,6 +10,8 @@ import androidx.appcompat.app.AppCompatActivity
 import com.hemnaath.skipcounter.R
 import com.hemnaath.skipcounter.ui.results.ResultsActivity
 import com.hemnaath.skipcounter.viewmodel.CounterViewModel
+import android.content.pm.PackageManager
+import androidx.activity.result.contract.ActivityResultContracts
 
 /**
  * CountingActivity: The main screen where users see live skip count and timer.
@@ -32,6 +34,16 @@ class CountingActivity : AppCompatActivity() {
     private lateinit var calibrationContainer: android.widget.LinearLayout
     private lateinit var stopButton: Button
 
+    private val audioPermission =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+
+            if(granted){
+                viewModel.startSession()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_counting)
@@ -44,7 +56,17 @@ class CountingActivity : AppCompatActivity() {
         stopButton = findViewById(R.id.stopButton)
 
         // Start the counting session
-        viewModel.startSession()
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED) {
+
+            viewModel.startSession()
+
+        } else {
+
+            audioPermission.launch(
+                android.Manifest.permission.RECORD_AUDIO
+            )
+        }
 
         // ==================== LiveData Observers ====================
 

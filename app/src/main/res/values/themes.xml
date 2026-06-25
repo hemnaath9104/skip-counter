@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <style name="Base.Theme.SkipCounter" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Your color customizations (if any) go here -->
+    </style>
 
-    <style name="Theme.SkipCounter" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.SkipCounter" parent="Base.Theme.SkipCounter" />
 </resources>

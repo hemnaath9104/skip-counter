@@ -84,10 +84,22 @@ class AudioEngine {
      * Call from ViewModel when user taps "Stop".
      */
     fun stopCounting(): Int {
+
         isRecording = false
-        audioRecord?.stop()
-        audioRecord?.release()
+
+        audioRecord?.let { recorder ->
+
+            if (recorder.recordingState ==
+                AudioRecord.RECORDSTATE_RECORDING) {
+
+                recorder.stop()
+            }
+
+            recorder.release()
+        }
+
         audioRecord = null
+
         return skipCount
     }
 
@@ -98,19 +110,33 @@ class AudioEngine {
      * This is a one-time setup before calibration.
      */
     private fun initializeAudioRecord() {
-        // Calculate buffer size (in bytes)
-        // PCM 16-bit = 2 bytes per sample
-        val bufferSizeBytes = BUFFER_SIZE_SAMPLES * 2
+
+        val bufferSizeBytes = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            CHANNEL_CONFIG,
+            AUDIO_FORMAT
+        )
 
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,  // Microphone input
+            MediaRecorder.AudioSource.MIC,
             SAMPLE_RATE,
             CHANNEL_CONFIG,
             AUDIO_FORMAT,
             bufferSizeBytes
         )
 
+
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+
+            audioRecord?.release()
+            audioRecord = null
+
+            throw IllegalStateException("AudioRecord initialization failed")
+        }
+
+
         audioRecord?.startRecording()
+
         isRecording = true
     }
 
