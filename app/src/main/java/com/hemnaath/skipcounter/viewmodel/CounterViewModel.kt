@@ -4,10 +4,11 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.Observer
+import androidx.lifecycle.viewModelScope
 import com.hemnaath.skipcounter.audio.AudioEngine
 import com.hemnaath.skipcounter.repository.SkipRepository
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -25,6 +26,11 @@ import kotlinx.coroutines.launch
  * Flow:
  * UI calls startSession() → ViewModel starts AudioEngine + timer → Updates LiveData
  * UI calls stopSession() → ViewModel stops AudioEngine, saves to DB → Final results
+ *
+ * Key fixes applied:
+ * - Named observers prevent observeForever memory leak
+ * - viewModelScope replaces GlobalScope (auto-cancelled when ViewModel is cleared)
+ * - skipsPerMinute uses seconds-based calculation for precision
  */
 class CounterViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -33,6 +39,7 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
     private val repository = SkipRepository(application)
 
     // ==================== UI State (LiveData) ====================
+
     // Skip count (updated by AudioEngine callback)
     private val _skipCountLiveData = MutableLiveData<Int>(0)
     val skipCountLiveData: LiveData<Int> = _skipCountLiveData
@@ -41,37 +48,55 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
     private val _elapsedTimeLiveData = MutableLiveData<String>("00:00")
     val elapsedTimeLiveData: LiveData<String> = _elapsedTimeLiveData
 
-    // Calibration progress (0-100%) shown during setup
+    // Calibration progress (0-100%) shown during setup phase
     private val _calibrationProgressLiveData = MutableLiveData<Int>(0)
     val calibrationProgressLiveData: LiveData<Int> = _calibrationProgressLiveData
 
-    // Session state: "idle", "calibrating", "counting", "finished"
+    // Session state: "idle" → "calibrating" → "counting" → "finished"
     private val _sessionStateLiveData = MutableLiveData<String>("idle")
     val sessionStateLiveData: LiveData<String> = _sessionStateLiveData
 
-    // Results after session ends
+    // Results after session ends (null until session completes)
     private val _sessionResultsLiveData = MutableLiveData<SessionResult?>(null)
     val sessionResultsLiveData: LiveData<SessionResult?> = _sessionResultsLiveData
 
     // ==================== Internal State ====================
-    private var startTimeMs = 0L  // When session started
-    private var timerJob: kotlinx.coroutines.Job? = null  // Timer coroutine handle
+    private var startTimeMs = 0L
+    private var timerJob: kotlinx.coroutines.Job? = null
     private var isSessionActive = false
+
+    // ==================== Named Observers ====================
+    // Named observers (not anonymous lambdas) so they can be removed in stopSession().
+    // Without removal, every startSession() call adds another observer.
+    // After 3 sessions: 3 observers all posting to _skipCountLiveData = triple counting.
+
+    private val skipObserver = Observer<Int> { count ->
+        _skipCountLiveData.postValue(count)
+    }
+
+    private val calibrationObserver = Observer<Int> { progress ->
+        _calibrationProgressLiveData.postValue(progress)
+
+        // When calibration finishes (100%), switch UI state to counting
+        if (progress == 100) {
+            _sessionStateLiveData.postValue("counting")
+        }
+    }
 
     // ==================== Public API ====================
 
     /**
      * Start a new skip counting session.
-     * Call from CountingScreen when user taps "Start".
+     * Call from CountingActivity when user taps "Start".
      *
      * Flow:
      * 1. Reset count and timer
-     * 2. Start AudioEngine (includes 3-second calibration)
-     * 3. Launch timer coroutine
-     * 4. Update UI state
+     * 2. Register named observers on AudioEngine LiveData
+     * 3. Start AudioEngine (includes 2-second calibration, then enters listening loop)
+     * 4. Launch timer coroutine
      */
     fun startSession() {
-        if (isSessionActive) return  // Already counting
+        if (isSessionActive) return  // Guard: prevent double-start
 
         isSessionActive = true
         startTimeMs = System.currentTimeMillis()
@@ -79,109 +104,112 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
         _elapsedTimeLiveData.value = "00:00"
         _sessionStateLiveData.value = "calibrating"
 
-        // Observe AudioEngine's skip count (it posts updates as skips are detected)
-        audioEngine.skipCountLiveData.observeForever { count ->
-            _skipCountLiveData.postValue(count)
-        }
+        // Register named observers (safe to call multiple times — same observer instance
+        // is registered only once even if startSession() is called again)
+        audioEngine.skipCountLiveData.observeForever(skipObserver)
+        audioEngine.calibrationProgressLiveData.observeForever(calibrationObserver)
 
-        // Observe calibration progress
-        audioEngine.calibrationProgressLiveData.observeForever { progress ->
-            _calibrationProgressLiveData.postValue(progress)
-
-            // When calibration finishes (100%), switch state to counting
-            if (progress == 100) {
-                _sessionStateLiveData.postValue("counting")
-            }
-        }
-
-        // Start AudioEngine (blocks until calibration done, then enters listening loop)
+        // Start AudioEngine on IO thread (calibrates first, then listens for skips)
         audioEngine.startCounting()
 
-        // Start timer coroutine (updates every 100ms)
+        // Start timer coroutine on Main dispatcher (updates UI every 100ms)
         startTimer()
     }
 
     /**
      * Stop the current session and save results.
-     * Call from CountingScreen when user taps "Stop".
+     * Call from CountingActivity when user taps "Stop" or presses back.
      *
      * Flow:
-     * 1. Stop AudioEngine (get final skip count)
-     * 2. Stop timer
-     * 3. Calculate session stats (duration, skips/min)
-     * 4. Save to database
-     * 5. Post results to UI
+     * 1. Remove named observers (prevents leak and duplicate counting)
+     * 2. Stop AudioEngine (get final skip count)
+     * 3. Stop timer
+     * 4. Calculate session stats
+     * 5. Save to database via viewModelScope
+     * 6. Post results to UI
      */
     fun stopSession() {
-        if (!isSessionActive) return  // Not counting
+        if (!isSessionActive) return  // Guard: prevent double-stop
 
         isSessionActive = false
         _sessionStateLiveData.value = "finished"
 
-        // Stop audio engine and get final count
+        // Remove observers FIRST to prevent any stray skip counts after stop
+        audioEngine.skipCountLiveData.removeObserver(skipObserver)
+        audioEngine.calibrationProgressLiveData.removeObserver(calibrationObserver)
+
+        // Stop AudioEngine and capture final skip count
         val finalSkipCount = audioEngine.stopCounting()
 
-        // Stop timer
+        // Stop timer coroutine
         timerJob?.cancel()
 
-        // Calculate stats
+        // Calculate session duration
         val durationMs = System.currentTimeMillis() - startTimeMs
         val durationSec = durationMs / 1000
-        val durationMin = durationSec / 60
 
-        // Skips per minute (avoid division by zero)
-        val skipsPerMinute = if (durationMin > 0) {
-            finalSkipCount / durationMin
+        // Skips per minute — use seconds-based calculation for precision.
+        // Integer division (finalSkipCount / durationMin) would truncate:
+        // 90 skips in 61 sec = 88.5/min, but integer division → 88.
+        // Seconds-based: (90 × 60.0) / 61 = 88.5/min (correct)
+        val skipsPerMinute = if (durationSec > 0) {
+            (finalSkipCount * 60.0) / durationSec
         } else {
-            finalSkipCount  // If less than 1 minute, report count as-is
+            0.0
         }
 
-        // Create result object
+        // Build result object
         val result = SessionResult(
             skipCount = finalSkipCount,
             durationSec = durationSec.toInt(),
-            skipsPerMinute = skipsPerMinute.toDouble()
+            skipsPerMinute = skipsPerMinute,
+            timestamp = System.currentTimeMillis()
         )
 
-        // Save to database (on IO thread)
-        GlobalScope.launch(Dispatchers.IO) {
+        // Save to database on IO thread.
+        // viewModelScope is tied to ViewModel lifecycle — automatically cancelled
+        // when onCleared() is called. GlobalScope has no lifecycle awareness.
+        viewModelScope.launch(Dispatchers.IO) {
             repository.saveSession(result)
         }
 
-        // Post results to UI
+        // Post results to UI (ResultsActivity observes this)
         _sessionResultsLiveData.postValue(result)
     }
 
     /**
-     * Reset state for a new session.
-     * Call from ResultsScreen when user taps "Try Again".
+     * Reset all state for a new session.
+     * Call from ResultsActivity when user taps "Try Again".
      */
     fun resetSession() {
         _skipCountLiveData.value = 0
         _elapsedTimeLiveData.value = "00:00"
         _sessionStateLiveData.value = "idle"
         _sessionResultsLiveData.value = null
+        _calibrationProgressLiveData.value = 0
     }
 
     // ==================== Private: Timer ====================
 
     /**
      * Launch a coroutine that updates elapsed time every 100ms.
-     * Converts milliseconds to MM:SS format for UI display.
+     * Runs on Main dispatcher so LiveData.value (not postValue) can be used.
+     *
+     * Uses viewModelScope — automatically cancelled when ViewModel is cleared,
+     * preventing the timer from running after the user leaves the screen.
      */
     private fun startTimer() {
-        timerJob = GlobalScope.launch(Dispatchers.Main) {
+        timerJob = viewModelScope.launch(Dispatchers.Main) {
             while (isSessionActive) {
                 val elapsedMs = System.currentTimeMillis() - startTimeMs
-                val formattedTime = formatElapsedTime(elapsedMs)
-                _elapsedTimeLiveData.postValue(formattedTime)
-                delay(100)  // Update every 100ms
+                _elapsedTimeLiveData.value = formatElapsedTime(elapsedMs)
+                delay(100)
             }
         }
     }
 
     /**
-     * Convert milliseconds to MM:SS format.
+     * Convert milliseconds to MM:SS display format.
      * Example: 65000ms → "01:05"
      */
     private fun formatElapsedTime(elapsedMs: Long): String {
@@ -191,26 +219,36 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
         return String.format("%02d:%02d", minutes, seconds)
     }
 
-    // ==================== Cleanup ====================
+    // ==================== Lifecycle ====================
 
     /**
-     * Called when ViewModel is destroyed (Activity closed, app backgrounded, etc.)
-     * Always stop audio and timers to release resources.
+     * Called when ViewModel is destroyed (Activity finishes, process dies).
+     * Always stop audio and cancel coroutines to release mic and CPU resources.
+     *
+     * Note: viewModelScope coroutines are cancelled automatically by the framework
+     * after onCleared() returns. The explicit timerJob?.cancel() here is defensive.
      */
     override fun onCleared() {
         super.onCleared()
         if (isSessionActive) {
-            stopSession()
+            // Ensure observers are removed and resources freed
+            audioEngine.skipCountLiveData.removeObserver(skipObserver)
+            audioEngine.calibrationProgressLiveData.removeObserver(calibrationObserver)
+            audioEngine.stopCounting()
         }
-        audioEngine.stopCounting()
         timerJob?.cancel()
     }
 
-    // ==================== Data Class ====================
+    // ==================== Data Classes ====================
 
     /**
-     * Result of a completed skip counting session.
-     * Posted to UI and saved to database.
+     * Immutable result of a completed skip counting session.
+     * Used for UI display and database persistence (Phase 2).
+     *
+     * @param skipCount     Total skips detected in the session
+     * @param durationSec   Session length in seconds
+     * @param skipsPerMinute Normalized rate for comparing sessions of different lengths
+     * @param timestamp     Unix epoch ms when session ended (for history ordering)
      */
     data class SessionResult(
         val skipCount: Int,
