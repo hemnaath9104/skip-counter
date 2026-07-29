@@ -11,6 +11,7 @@ import com.hemnaath.skipcounter.R
 import com.hemnaath.skipcounter.ui.results.ResultsActivity
 import com.hemnaath.skipcounter.viewmodel.CounterViewModel
 import android.content.pm.PackageManager
+import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 
 /**
@@ -39,14 +40,34 @@ class CountingActivity : AppCompatActivity() {
             ActivityResultContracts.RequestPermission()
         ) { granted ->
 
-            if(granted){
+            if (granted) {
                 viewModel.startSession()
+            } else {
+                // Check if permission was permanently denied (user won't see the
+                // system dialog again — must go to Settings manually)
+                val permanentlyDenied = !shouldShowRequestPermissionRationale(
+                    android.Manifest.permission.RECORD_AUDIO
+                )
+
+                if (permanentlyDenied) {
+                    showSettingsDialog()
+                } else {
+                    android.widget.Toast.makeText(
+                        this,
+                        "Microphone access is required to count skips.",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                    finish()
+                }
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_counting)
+        onBackPressedDispatcher.addCallback(this) {
+            viewModel.stopSession()
+        }
 
         // Initialize UI views
         skipCountDisplay = findViewById(R.id.skipCountDisplay)
@@ -122,6 +143,30 @@ class CountingActivity : AppCompatActivity() {
     }
 
     /**
+     * Show a dialog explaining the app needs microphone access, then
+     * open the app's Settings page so the user can grant it manually.
+     * This is the only way to re-request the permission once Android
+     * has stopped showing the system dialog (after prior denials).
+     */
+    private fun showSettingsDialog() {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Microphone Permission Needed")
+            .setMessage("SkipCounter needs microphone access to detect skips. Please enable it in Settings.")
+            .setPositiveButton("Open Settings") { _, _ ->
+                val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = android.net.Uri.fromParts("package", packageName, null)
+                }
+                startActivity(intent)
+                finish()
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                finish()
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    /**
      * Navigate to ResultsActivity with final stats.
      * Pass the results via Intent extras.
      */
@@ -135,15 +180,5 @@ class CountingActivity : AppCompatActivity() {
             startActivity(intent)
             finish()  // Don't keep this activity in the stack
         }
-    }
-
-    /**
-     * Called when user presses back button.
-     * Warn them that stopping will end the session.
-     */
-    override fun onBackPressed() {
-        // Optional: Show a dialog asking "Are you sure you want to stop?"
-        // For now, just stop the session
-        viewModel.stopSession()
     }
 }
