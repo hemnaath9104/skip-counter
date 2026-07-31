@@ -4,6 +4,10 @@ plugins {
 }
 
 android {
+    buildFeatures {
+        compose = true
+    }
+
     namespace = "com.hemnaath.skipcounter"
     compileSdk {
         version = release(36) {
@@ -65,4 +69,13 @@ dependencies {
 
     // AppCompat (for AppCompatActivity)
     implementation("androidx.appcompat:appcompat:1.6.1")
+
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.activity.compose)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
 }
